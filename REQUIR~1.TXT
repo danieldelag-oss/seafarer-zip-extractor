@@ -1,0 +1,3 @@
+msal==1.30.0
+requests==2.32.3
+rarfile==4.2
