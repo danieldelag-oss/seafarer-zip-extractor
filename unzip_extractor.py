@@ -1,18 +1,19 @@
 """
-Seafarer ZIP Extractor (search-based)
-======================================
+Seafarer ZIP Extractor (search-based, drive-root search)
+=========================================================
 Polls OneDrive for .zip attachments under /Email attachments/**/Original/,
 extracts allowed file types in place, renames source zips to _processed_*.zip.
 
-Uses Microsoft Graph search instead of recursive folder listing, so it stays
-fast even when /Email attachments/ has thousands of subfolders.
+Uses drive-root Graph search; path-based search endpoint isn't supported in
+app-only context (returns 403), so we search the whole drive and filter
+results to the allowed root in Python.
 
 Safety guards:
   - Refuses to operate outside /Email attachments/ (hardcoded prefix)
   - Only processes zips whose parent folder ends with /Original
   - Caps extracted size per zip (default 500 MB)
   - Caps file count per zip (default 200)
-  - Allow-listed extensions only (PDF, JPG, JPEG, PNG, TIF, etc.)
+  - Allow-listed extensions only
   - Skips password-protected zips (rename to _REJECTED_*)
   - Skips corrupt zips (rename to _REJECTED_*)
 """
@@ -27,9 +28,6 @@ from urllib.parse import quote
 import msal
 import requests
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 TENANT_ID = os.environ["AZURE_TENANT_ID"]
 CLIENT_ID = os.environ["AZURE_CLIENT_ID"]
 CLIENT_SECRET = os.environ["AZURE_CLIENT_SECRET"]
@@ -51,9 +49,6 @@ logging.basicConfig(
 log = logging.getLogger("unzip")
 
 
-# ---------------------------------------------------------------------------
-# Graph helpers
-# ---------------------------------------------------------------------------
 def get_access_token() -> str:
     app = msal.ConfidentialClientApplication(
         CLIENT_ID,
@@ -114,14 +109,12 @@ def get_drive_id(token: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Search-based zip discovery
+# Drive-root search + Python filter
 # ---------------------------------------------------------------------------
 def find_zip_files(drive_id: str, token: str) -> list[tuple[str, dict]]:
-    """Use Graph search scoped to /Email attachments/ to find all .zip files.
-    Returns (folder_path, item) tuples for zips whose parent folder ends with
-    /Original and that aren't already _processed_ or _REJECTED_."""
-    encoded_root = quote(EMAIL_ATTACHMENTS_ROOT)
-    url = f"{GRAPH_BASE}/drives/{drive_id}/root:{encoded_root}:/search(q='.zip')?$top=200"
+    """Search the whole drive for .zip files, filter to those in
+    /Email attachments/.../Original."""
+    url = f"{GRAPH_BASE}/drives/{drive_id}/root/search(q='.zip')?$top=200"
 
     raw_items: list[dict] = []
     page = 0
@@ -130,7 +123,7 @@ def find_zip_files(drive_id: str, token: str) -> list[tuple[str, dict]]:
         data = graph_get(url, token)
         raw_items.extend(data.get("value", []))
         url = data.get("@odata.nextLink")
-    log.info("Search returned %d items across %d page(s)", len(raw_items), page)
+    log.info("Drive search returned %d items across %d page(s)", len(raw_items), page)
 
     results: list[tuple[str, dict]] = []
     for item in raw_items:
@@ -147,21 +140,18 @@ def find_zip_files(drive_id: str, token: str) -> list[tuple[str, dict]]:
         folder_path = parent_path_raw.split(":", 1)[1] if ":" in parent_path_raw else parent_path_raw
 
         if not folder_path.startswith(EMAIL_ATTACHMENTS_ROOT):
-            log.warning("Skipping zip outside allowed root: %s/%s", folder_path, name)
-            continue
+            continue  # silently skip; not in our scope
         if not folder_path.endswith("/Original"):
-            log.info("Skipping zip not in Original/ subfolder: %s/%s", folder_path, name)
+            log.info("Skipping zip not in Original/: %s/%s", folder_path, name)
             continue
 
         results.append((folder_path, item))
 
-    log.info("Found %d zip(s) to process", len(results))
+    log.info("Found %d zip(s) under %s/**/Original/ to process",
+             len(results), EMAIL_ATTACHMENTS_ROOT)
     return results
 
 
-# ---------------------------------------------------------------------------
-# Zip validation
-# ---------------------------------------------------------------------------
 def validate_zip(zip_bytes: bytes) -> tuple[bool, str | None]:
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -179,9 +169,6 @@ def validate_zip(zip_bytes: bytes) -> tuple[bool, str | None]:
     return True, None
 
 
-# ---------------------------------------------------------------------------
-# Processing
-# ---------------------------------------------------------------------------
 def upload_to_folder(drive_id, folder_path, filename, content, token):
     if not folder_path.startswith(EMAIL_ATTACHMENTS_ROOT):
         raise RuntimeError(f"Refusing upload outside allowed root: {folder_path}")
@@ -239,11 +226,8 @@ def process_zip(drive_id, folder_path, zip_item, token):
     rename_item(drive_id, item_id, f"_processed_{name}", token)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main() -> int:
-    log.info("Seafarer ZIP Extractor (search-based) starting")
+    log.info("Seafarer ZIP Extractor (drive-root search) starting")
     if not EMAIL_ATTACHMENTS_ROOT.startswith("/Email attachments"):
         log.error("Path safety check failed — refusing to run.")
         return 2
