@@ -1,28 +1,30 @@
 """
-Seafarer ZIP Extractor (search-based, drive-root search)
-=========================================================
-Polls OneDrive for .zip attachments under /Email attachments/**/Original/,
+Seafarer ZIP Extractor (scoped walk + parallel)
+================================================
+Polls OneDrive for .zip attachments under /Email attachments/{YYYY-MM ...}/{DD}/{Sailor}/Original/,
 extracts allowed file types in place, renames source zips to _processed_*.zip.
 
-Uses drive-root Graph search; path-based search endpoint isn't supported in
-app-only context (returns 403), so we search the whole drive and filter
-results to the allowed root in Python.
+Strategy:
+  - Walk only the N most recent year-month folders (default 2).
+  - Make sailor-level listings concurrently (5 at a time) for speed.
+  - Use search NOT used — tenant blocks app-only search with 403.
 
 Safety guards:
-  - Refuses to operate outside /Email attachments/ (hardcoded prefix)
+  - Hardcoded prefix check: /Email attachments only
   - Only processes zips whose parent folder ends with /Original
   - Caps extracted size per zip (default 500 MB)
   - Caps file count per zip (default 200)
   - Allow-listed extensions only
-  - Skips password-protected zips (rename to _REJECTED_*)
-  - Skips corrupt zips (rename to _REJECTED_*)
+  - Skips/quarantines password-protected and corrupt zips
 """
 
 import io
 import logging
 import os
 import sys
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 
 import msal
@@ -36,11 +38,17 @@ TARGET_USER_UPN = os.environ["TARGET_USER_UPN"]
 EMAIL_ATTACHMENTS_ROOT = "/Email attachments"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
+# Performance tuning
+MAX_YEAR_MONTHS_TO_SCAN = 2     # Scan only the N most recent year-month folders
+PARALLEL_WORKERS = 5            # Concurrent Graph calls (Graph throttles ~10+)
+
+# Safety limits
 MAX_EXTRACTED_SIZE_BYTES = 500 * 1024 * 1024
 MAX_FILES_PER_ZIP = 200
 ALLOWED_EXTENSIONS = {
     ".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".gif", ".bmp",
 }
+EXCLUDE_NAMES = {"Invoices", "General Documents"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,110 +57,165 @@ logging.basicConfig(
 log = logging.getLogger("unzip")
 
 
-def get_access_token() -> str:
+# ---------------------------------------------------------------------------
+# Graph helpers with simple retry
+# ---------------------------------------------------------------------------
+def _request_with_retry(method, url, token, *, max_retries=3, **kw):
+    headers = kw.pop("headers", {})
+    headers["Authorization"] = f"Bearer {token}"
+    for attempt in range(max_retries):
+        r = requests.request(method, url, headers=headers, timeout=60, **kw)
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", "2"))
+            log.warning("Throttled (429), retrying after %ds", wait)
+            time.sleep(wait)
+            continue
+        if r.status_code in (500, 502, 503, 504):
+            wait = 2 ** attempt
+            log.warning("Graph %d, retrying in %ds (attempt %d)", r.status_code, wait, attempt + 1)
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r
+    raise RuntimeError(f"Graph call failed after {max_retries} retries: {url}")
+
+
+def graph_get(url, token):
+    return _request_with_retry("GET", url, token).json()
+
+
+def graph_get_bytes(url, token):
+    return _request_with_retry("GET", url, token).content
+
+
+def graph_put_bytes(url, token, content):
+    _request_with_retry(
+        "PUT", url, token,
+        headers={"Content-Type": "application/octet-stream"},
+        data=content,
+    )
+
+
+def graph_patch_json(url, token, body):
+    _request_with_retry(
+        "PATCH", url, token,
+        headers={"Content-Type": "application/json"},
+        json=body,
+    )
+
+
+def get_access_token():
     app = msal.ConfidentialClientApplication(
         CLIENT_ID,
         authority=f"https://login.microsoftonline.com/{TENANT_ID}",
         client_credential=CLIENT_SECRET,
     )
-    result = app.acquire_token_for_client(
-        scopes=["https://graph.microsoft.com/.default"]
-    )
+    result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
     if "access_token" not in result:
-        raise RuntimeError(
-            f"Token acquisition failed: {result.get('error_description', result)}"
-        )
+        raise RuntimeError(f"Token acquisition failed: {result.get('error_description', result)}")
     return result["access_token"]
 
 
-def graph_get(url: str, token: str) -> dict:
-    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
-    r.raise_for_status()
-    return r.json()
-
-
-def graph_get_bytes(url: str, token: str) -> bytes:
-    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=300)
-    r.raise_for_status()
-    return r.content
-
-
-def graph_put_bytes(url: str, token: str, content: bytes) -> None:
-    r = requests.put(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/octet-stream",
-        },
-        data=content,
-        timeout=300,
-    )
-    r.raise_for_status()
-
-
-def graph_patch_json(url: str, token: str, body: dict) -> None:
-    r = requests.patch(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json=body,
-        timeout=60,
-    )
-    r.raise_for_status()
-
-
-def get_drive_id(token: str) -> str:
+def get_drive_id(token):
     url = f"{GRAPH_BASE}/users/{quote(TARGET_USER_UPN)}/drive"
     return graph_get(url, token)["id"]
 
 
-# ---------------------------------------------------------------------------
-# Drive-root search + Python filter
-# ---------------------------------------------------------------------------
-def find_zip_files(drive_id: str, token: str) -> list[tuple[str, dict]]:
-    """Search the whole drive for .zip files, filter to those in
-    /Email attachments/.../Original."""
-    url = f"{GRAPH_BASE}/drives/{drive_id}/root/search(q='.zip')?$top=200"
-
-    raw_items: list[dict] = []
-    page = 0
+def list_folder_by_path(drive_id, path, token):
+    encoded = quote(path)
+    url = f"{GRAPH_BASE}/drives/{drive_id}/root:{encoded}:/children?$top=200"
+    items = []
     while url:
-        page += 1
         data = graph_get(url, token)
-        raw_items.extend(data.get("value", []))
+        items.extend(data.get("value", []))
         url = data.get("@odata.nextLink")
-    log.info("Drive search returned %d items across %d page(s)", len(raw_items), page)
+    return items
 
-    results: list[tuple[str, dict]] = []
-    for item in raw_items:
-        if item.get("folder"):
+
+def _list_safe(drive_id, path, token):
+    """Like list_folder_by_path but returns [] on 404 instead of raising."""
+    try:
+        return list_folder_by_path(drive_id, path, token)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return []
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Scoped walk: last N year-months only, parallel sailor scans
+# ---------------------------------------------------------------------------
+def _scan_sailor_for_zips(drive_id, sailor_path, token):
+    """Return list of (Original_path, zip_item) tuples for unprocessed zips in
+    {sailor_path}/Original. Used as a worker in the thread pool."""
+    original_path = f"{sailor_path}/Original"
+    files = _list_safe(drive_id, original_path, token)
+    out = []
+    for f in files:
+        if f.get("folder"):
             continue
-        name = item.get("name", "")
+        name = f["name"]
         if not name.lower().endswith(".zip"):
             continue
         if name.startswith("_processed_") or name.startswith("_REJECTED_"):
             continue
+        out.append((original_path, f))
+    return out
 
-        parent_path_raw = item.get("parentReference", {}).get("path", "")
-        # parentReference.path looks like "/drives/{id}/root:/Email attachments/.../Original"
-        folder_path = parent_path_raw.split(":", 1)[1] if ":" in parent_path_raw else parent_path_raw
 
-        if not folder_path.startswith(EMAIL_ATTACHMENTS_ROOT):
-            continue  # silently skip; not in our scope
-        if not folder_path.endswith("/Original"):
-            log.info("Skipping zip not in Original/: %s/%s", folder_path, name)
-            continue
+def find_zip_files(drive_id, token):
+    results = []
 
-        results.append((folder_path, item))
+    # Step 1: list year-month folders, take last N (most recent by name)
+    ym_items = _list_safe(drive_id, EMAIL_ATTACHMENTS_ROOT, token)
+    ym_folders = [
+        it for it in ym_items
+        if it.get("folder") and not it["name"].startswith(("_", "."))
+    ]
+    ym_folders.sort(key=lambda x: x["name"], reverse=True)
+    ym_folders = ym_folders[:MAX_YEAR_MONTHS_TO_SCAN]
+    log.info("Scanning %d year-month folder(s): %s",
+             len(ym_folders), [it["name"] for it in ym_folders])
 
-    log.info("Found %d zip(s) under %s/**/Original/ to process",
-             len(results), EMAIL_ATTACHMENTS_ROOT)
+    # Step 2: walk year-month -> day -> sailor; collect sailor paths
+    sailor_paths = []
+    for ym in ym_folders:
+        ym_path = f"{EMAIL_ATTACHMENTS_ROOT}/{ym['name']}"
+        day_items = _list_safe(drive_id, ym_path, token)
+        for d in day_items:
+            if not d.get("folder") or d["name"].startswith(("_", ".")):
+                continue
+            d_path = f"{ym_path}/{d['name']}"
+            sailor_items = _list_safe(drive_id, d_path, token)
+            for s in sailor_items:
+                if not s.get("folder"):
+                    continue
+                if s["name"].startswith(("_", ".")) or s["name"] in EXCLUDE_NAMES:
+                    continue
+                sailor_paths.append(f"{d_path}/{s['name']}")
+    log.info("Total sailor folders to scan: %d", len(sailor_paths))
+
+    # Step 3: scan all sailor/Original folders concurrently
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as ex:
+        futures = {
+            ex.submit(_scan_sailor_for_zips, drive_id, sp, token): sp
+            for sp in sailor_paths
+        }
+        for fut in as_completed(futures):
+            sp = futures[fut]
+            try:
+                results.extend(fut.result())
+            except Exception:
+                log.exception("Error scanning %s", sp)
+
+    log.info("Found %d zip(s) to process", len(results))
     return results
 
 
-def validate_zip(zip_bytes: bytes) -> tuple[bool, str | None]:
+# ---------------------------------------------------------------------------
+# Zip validation + processing (unchanged from before)
+# ---------------------------------------------------------------------------
+def validate_zip(zip_bytes):
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
     except zipfile.BadZipFile:
@@ -188,7 +251,7 @@ def process_zip(drive_id, folder_path, zip_item, token):
     log.info("Processing %s/%s", folder_path, name)
 
     if not folder_path.startswith(EMAIL_ATTACHMENTS_ROOT):
-        log.error("Refusing — folder outside allowed root: %s", folder_path)
+        log.error("Refusing — outside allowed root: %s", folder_path)
         return
 
     download_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}/content"
@@ -226,8 +289,8 @@ def process_zip(drive_id, folder_path, zip_item, token):
     rename_item(drive_id, item_id, f"_processed_{name}", token)
 
 
-def main() -> int:
-    log.info("Seafarer ZIP Extractor (drive-root search) starting")
+def main():
+    log.info("Seafarer ZIP Extractor (scoped walk + parallel) starting")
     if not EMAIL_ATTACHMENTS_ROOT.startswith("/Email attachments"):
         log.error("Path safety check failed — refusing to run.")
         return 2
@@ -242,7 +305,8 @@ def main() -> int:
             try:
                 process_zip(drive_id, folder_path, zip_item, token)
             except Exception:
-                log.exception("Error processing %s/%s", folder_path, zip_item.get("name", "?"))
+                log.exception("Error processing %s/%s",
+                              folder_path, zip_item.get("name", "?"))
 
         log.info("Done.")
         return 0
